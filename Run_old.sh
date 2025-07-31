@@ -16,4 +16,4 @@ LOCAL_TARGET_PATH="$LOCAL_TARGET_DIR/$S3_FILENAME"
 #Run the actual job
 chmod +x $BASEDIR/WildcardPipeline_noHomogenization.sh
 
-./WildcardPipeline.sh "$LOCAL_TARGET_PATH"
+./WildcardPipeline_noHomogenization.sh "$LOCAL_TARGET_PATH"
