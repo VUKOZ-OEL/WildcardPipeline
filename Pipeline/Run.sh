@@ -11,15 +11,18 @@ trap 'rc=$?; echo "ERROR: ${BASH_SOURCE[0]} failed at line ${LINENO} (exit code:
 
 # ------------------------------------------
 # MODIFY THESE VARIABLES BEFORE EACH RUN
-S3_SUBFOLDER="FVA-BW"                            # Folder/prefix in wp2 bucket
-S3_FILENAME="FVA-BW__14__Wildseemoor__1123__ULS.laz"      # LAZ file to process
+S3_SUBFOLDER="$1"                          # Folder/prefix in wp2 bucket ie "FVA-BW" | "VUK"
+S3_FILENAME="$2"      # LAZ file to process ie: "FVA-BW__14__Wildseemoor__1123__ULS.laz"
+POLYGON_SHP_FILENAME="$3"
 
-NOFELEMENTS="10"
-VOXELSIZE="0.2"                                   # meters
-COORDINATES="EPSG:5514"                                    # EPSG system in use for the data; Number only
+
+COORDINATES=${3:-"EPSG:5514"}   
+VOXELSIZE=${4:-0.2}   # is number was text
+NOFELEMENTS=${5:-10}                   
+                            
 
 # If the polygons prefix contains MULTIPLE .shp files, set the exact .shp filename.
-POLYGON_SHP_FILENAME="fva_bw_site_boundaries_3035.shp"
+
 
 # ---- SITE_ID DERIVATION (EDIT IF NEEDED) ----
 # Polygon layers contain multiple sites identified by the "site_id" column.
