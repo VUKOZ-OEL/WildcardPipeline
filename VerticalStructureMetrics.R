@@ -1,16 +1,51 @@
 suppressMessages(library(lidR))
 suppressMessages(library(raster))   
 suppressMessages(library(data.table))
+suppressMessages(library(sf))
 
 # ---------------------- CLI ----------------------
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 4) {
-  stop("Usage: Rscript VSC_UVC_Metrics.R <input_folder> <output_folder> <max_height_file> <output_prefix>")
+if (length(args) != 5) {
+  stop("Usage: Rscript VSC_UVC_Metrics.R <input_folder> <output_folder> <max_height_file> <output_prefix> <LOCAL|EPSG:code>")
 }
 las_folder <- args[1]
 output_folder <- args[2]
 max_height_file  <- args[3]   
 base_name <- args[4]
+coordinates <- trimws(args[5])
+
+if (is.na(coordinates) || !nzchar(coordinates)) {
+  stop("coordinates must be LOCAL or a valid CRS such as EPSG:3035.")
+}
+
+local_mode <- identical(toupper(coordinates), "LOCAL")
+if (local_mode) {
+  coordinates <- "LOCAL"
+  configured_crs <- sf::NA_crs_
+} else {
+  configured_crs <- suppressWarnings(sf::st_crs(coordinates))
+  if (is.na(configured_crs)) {
+    stop("Invalid coordinate system. Use LOCAL or a valid CRS such as EPSG:3035; got: ", coordinates)
+  }
+}
+
+crs_missing <- function(x) is.null(x) || is.na(x)
+crs_text_for_raster <- function(x) {
+  if (crs_missing(x)) return(coordinates)
+  input <- tryCatch(x$input, error = function(e) NA_character_)
+  wkt <- tryCatch(x$wkt, error = function(e) NA_character_)
+  if (!is.na(input) && nzchar(input)) return(input)
+  if (!is.na(wkt) && nzchar(wkt)) return(wkt)
+  coordinates
+}
+set_output_crs <- function(r, source_crs) {
+  if (local_mode) {
+    raster::crs(r) <- NA_character_
+  } else {
+    raster::crs(r) <- crs_text_for_raster(source_crs)
+  }
+  r
+}
 
 # Read global max height
 max_height_global <- as.numeric(readLines(max_height_file, warn = FALSE))
@@ -32,6 +67,17 @@ las_combined <- do.call(rbind, lapply(las_files, function(file) {
   if (!is.null(las) && !is.empty(las)) return(las) else return(NULL)
 }))
 if (is.null(las_combined) || is.empty(las_combined)) stop("No valid point cloud data after merging.")
+
+las_crs_obj <- tryCatch(lidR::st_crs(las_combined), error = function(e) NULL)
+if (local_mode) {
+  lidR::st_crs(las_combined) <- sf::NA_crs_
+  las_crs_obj <- sf::NA_crs_
+  cat("Coordinate mode: LOCAL; output rasters will have no CRS.\n")
+} else if (crs_missing(las_crs_obj)) {
+  lidR::st_crs(las_combined) <- configured_crs
+  las_crs_obj <- lidR::st_crs(las_combined)
+  cat("LAS had no CRS; using configured fallback: ", coordinates, "\n", sep = "")
+}
 
 # Filter to non-ground points above 1 meter
 las_nonground <- filter_poi(las_combined, Classification != 2 )
@@ -147,15 +193,16 @@ compute_NRD <-function(z,
 
 r_NRD <- grid_metrics(las_nonground, ~ compute_NRD(Z,i = 0.5, j = 3.0), res = 1)
 
-# Set CRS and save rasters
-crs_code <- "EPSG:5514"
-crs(r_H) <- crs_code
-#crs(r_H10) <- crs_code
-crs(r_ENL1) <- crs_code
-crs(r_ENL2) <- crs_code
-crs(r_VCI) <- crs_code
-crs(r_UCI) <- crs_code
-crs(r_NRD) <- crs_code
+# Set CRS and save rasters. LOCAL outputs intentionally remain unreferenced;
+# georeferenced outputs retain the actual LAS CRS, with the configured CRS used
+# only as a fallback when the LAS metadata are absent.
+r_H    <- set_output_crs(r_H,    las_crs_obj)
+#r_H10 <- set_output_crs(r_H10,  las_crs_obj)
+r_ENL1 <- set_output_crs(r_ENL1, las_crs_obj)
+r_ENL2 <- set_output_crs(r_ENL2, las_crs_obj)
+r_VCI  <- set_output_crs(r_VCI,  las_crs_obj)
+r_UCI  <- set_output_crs(r_UCI,  las_crs_obj)
+r_NRD  <- set_output_crs(r_NRD,  las_crs_obj)
 
 
 writeRaster(r_H,      file.path(raster_output_path, paste0(base_name, "_H.tif")),     overwrite = TRUE)
@@ -213,4 +260,3 @@ dev.off()
 
 
 cat("Vertical structure metrics processing complete. Results saved to:", output_folder, "\n")
-

@@ -2,17 +2,53 @@
 suppressMessages(library(lidR))
 suppressMessages(library(raster))
 suppressMessages(library(data.table))
+suppressMessages(library(dplyr))
+suppressMessages(library(sf))
 
 # Read command line arguments
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 4) {
-  stop("Usage: Rscript CanopyDensityMetrics.R <input_folder> <output_folder> <max_height_file> <output_prefix>")
+if (length(args) != 5) {
+  stop("Usage: Rscript CanopyDensityMetrics.R <input_folder> <output_folder> <max_height_file> <output_prefix> <LOCAL|EPSG:code>")
 }
 
 input_folder <- args[1]
 output_folder <- args[2]
 max_height_file <- args[3]
 base_name <- args[4]
+coordinates <- trimws(args[5])
+
+if (is.na(coordinates) || !nzchar(coordinates)) {
+  stop("coordinates must be LOCAL or a valid CRS such as EPSG:3035.")
+}
+
+local_mode <- identical(toupper(coordinates), "LOCAL")
+if (local_mode) {
+  coordinates <- "LOCAL"
+  configured_crs <- sf::NA_crs_
+} else {
+  configured_crs <- suppressWarnings(sf::st_crs(coordinates))
+  if (is.na(configured_crs)) {
+    stop("Invalid coordinate system. Use LOCAL or a valid CRS such as EPSG:3035; got: ", coordinates)
+  }
+}
+
+crs_missing <- function(x) is.null(x) || is.na(x)
+crs_text_for_raster <- function(x) {
+  if (crs_missing(x)) return(coordinates)
+  input <- tryCatch(x$input, error = function(e) NA_character_)
+  wkt <- tryCatch(x$wkt, error = function(e) NA_character_)
+  if (!is.na(input) && nzchar(input)) return(input)
+  if (!is.na(wkt) && nzchar(wkt)) return(wkt)
+  coordinates
+}
+set_output_crs <- function(r, source_crs) {
+  if (local_mode) {
+    raster::crs(r) <- NA_character_
+  } else {
+    raster::crs(r) <- crs_text_for_raster(source_crs)
+  }
+  r
+}
 
 # Read global max height
 max_height_global <- as.numeric(readLines(max_height_file, warn = FALSE))
@@ -34,33 +70,36 @@ las_combined <- do.call(rbind, lapply(las_files, function(file) {
 }))
 if (is.null(las_combined) || is.empty(las_combined)) stop("No valid point cloud data after merging.")
 
+las_crs_obj <- tryCatch(lidR::st_crs(las_combined), error = function(e) NULL)
+if (local_mode) {
+  lidR::st_crs(las_combined) <- sf::NA_crs_
+  las_crs_obj <- sf::NA_crs_
+  cat("Coordinate mode: LOCAL; output rasters will have no CRS.\n")
+} else if (crs_missing(las_crs_obj)) {
+  lidR::st_crs(las_combined) <- configured_crs
+  las_crs_obj <- lidR::st_crs(las_combined)
+  cat("LAS had no CRS; using configured fallback: ", coordinates, "\n", sep = "")
+}
+
 # Filter to non-ground points above 1m
 las_nonground <- filter_poi(las_combined, Classification != 2 & Z > 1)
 
+cat("Canopy density metrics calculation \n")
 cat("Metric 1 calculation \n")
 # Metric 1: Canopy Density (points per column)
+# Canopy density = number of nonground points above 1 m per m²
 r_density <- grid_density(las_nonground, res = 1)
-crs(r_density) <- "EPSG:5514"
+r_density <- set_output_crs(r_density, las_crs_obj)
 writeRaster(r_density, file.path(raster_output_path, paste0(base_name, "_CanopyDensity.tif")), overwrite = TRUE)
 
-cat("Metric 2 calculation \n")
-# Metric 2: Canopy Porosity (ratio of ground to all points in column, but from nonground points context)
-las_all <- filter_poi(las_combined, Z > 2)  # Above 2m points (both ground & non-ground)
-porosity_metric <- function(z, classification) {
-  total <- length(z)
-  ground <- sum(classification == 2, na.rm = TRUE)
-  if (total == 0) return(NA) else return(ground / total)
-}
-r_porosity <- grid_metrics(las_all, porosity_metric(Z, Classification), res = 1)
-crs(r_porosity) <- "EPSG:5514"
-writeRaster(r_porosity, file.path(raster_output_path, paste0(base_name, "_CanopyPorosity.tif")), overwrite = TRUE)
-
 cat("Metric 3 calculation \n")
-# Metric 3: Top Canopy Rugosity = SD of per-column 98th percentile height
-r_top_height <- grid_metrics(las_nonground, ~quantile(Z, 0.98, na.rm = TRUE), res = 1)
-crs(r_top_height) <- "EPSG:5514"
-writeRaster(r_top_height, file.path(raster_output_path, paste0(base_name, "_TopCanopyHeight.tif")), overwrite = TRUE)
-top_rugosity <- sd(values(r_top_height), na.rm = TRUE)
+voxels <- voxel_metrics(las_nonground, ~list(density = length(Z)), res = 1)
+voxel_df <- as.data.frame(voxels)
+column_rugosity <- voxel_df %>% group_by(X, Y) %>% summarise(rugosity = sd(density, na.rm = TRUE), .groups = "drop")
+rugosity_raster <- rasterFromXYZ(column_rugosity)
+rugosity_raster <- set_output_crs(rugosity_raster, las_crs_obj)
+writeRaster(rugosity_raster, file.path(raster_output_path, paste0(base_name, "_CanopyRugosity.tif")), overwrite = TRUE)
+global_rugosity <- mean(column_rugosity$rugosity, na.rm = TRUE)
 
 cat("Metric 4 calculation \n")
 # Metric 4: Clumping Index
@@ -85,16 +124,15 @@ calculate_clumping_index <- function(chm, max_height_global, height_bins = seq(0
   }
 }
 
-chm <- grid_metrics(las_nonground, ~mean(Z, na.rm = TRUE), res = 1)
+chm <- grid_metrics(las_nonground, ~quantile(Z, 0.98, na.rm = TRUE), res = 1)
 clumping_val <- calculate_clumping_index(chm, max_height_global)
 
 cat("Save metric txt \n")
 # Save summary metrics
 metrics <- data.frame(
   AvgClumpingIndex = clumping_val,
-  AvgCanopyPorosity = mean(values(r_porosity), na.rm = TRUE),
   AvgCanopyDensity = mean(values(r_density), na.rm = TRUE),
-  TopCanopyRugosity = top_rugosity
+  CanopyRugosity = global_rugosity
 )
 
 write.table(metrics, file = file.path(output_folder, paste0(base_name, "_CanopyDensityMetrics.txt")),
@@ -106,12 +144,12 @@ png(file.path(output_folder, paste0(base_name, "_CanopyDensity.png")), width = 8
 plot(r_density, main = "Canopy Density", xlab = "X", ylab = "Y")
 dev.off()
 
-png(file.path(output_folder, paste0(base_name, "_CanopyPorosity.png")), width = 800, height = 600)
-plot(r_porosity, main = "Canopy Porosity", xlab = "X", ylab = "Y")
-dev.off()
+#png(file.path(output_folder, paste0(base_name, "_CanopyPorosity.png")), width = 800, height = 600)
+#plot(r_porosity, main = "Canopy Porosity", xlab = "X", ylab = "Y")
+#dev.off()
 
-png(file.path(output_folder, paste0(base_name, "_TopCanopyHeight.png")), width = 800, height = 600)
-plot(r_top_height, main = "Top Canopy Height", xlab = "X", ylab = "Y")
+png(file.path(output_folder, paste0(base_name, "_CanopyRugosity.png")), width = 800, height = 600)
+plot(rugosity_raster, main = "Canopy Rugosity", xlab = "X", ylab = "Y")
 dev.off()
 
 cat("Canopy density metrics processing complete. Results saved to:", output_folder, "\n")
